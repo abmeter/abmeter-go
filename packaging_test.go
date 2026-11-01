@@ -49,7 +49,7 @@ func TestRequiredFilesPresent(t *testing.T) {
 		"abmeter.go", "version.go", "numutils.go", "assignment_config.go",
 		"resolver.go", "resolver_provider.go", "client.go", "submitter.go",
 		"config.go", "types.go", "apierror.go", "user.go",
-		"testdata/num_utils_parity.json",
+		"testdata/num_utils_parity.json", "testdata/error_envelope.json",
 	}
 	for _, path := range required {
 		if _, err := os.Stat(path); err != nil {

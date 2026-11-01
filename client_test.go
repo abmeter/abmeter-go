@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func newTestClient(baseURL string) *client {
@@ -111,17 +112,17 @@ func TestAPIErrorClassification(t *testing.T) {
 		}
 	}
 
-	partial := newAPIError(400, []byte(`{"error":"validation","details":{"failures":[{"index":0}],"invalid_count":1}}`))
+	partial := newAPIError(400, nil, []byte(`{"error":"validation","details":{"failures":[{"index":0}],"invalid_count":1}}`))
 	if !partial.PartialFailure() {
 		t.Error("expected partial failure")
 	}
 	if partial.FailureCount() != 1 {
 		t.Errorf("failure count = %d", partial.FailureCount())
 	}
-	if newAPIError(400, []byte(`{"error":"bad"}`)).PartialFailure() {
+	if newAPIError(400, nil, []byte(`{"error":"bad"}`)).PartialFailure() {
 		t.Error("400 without failures must not be a partial failure")
 	}
-	if plain := newAPIError(502, []byte("Bad Gateway")); plain.Message != "Bad Gateway" {
+	if plain := newAPIError(502, nil, []byte("Bad Gateway")); plain.Message != "Bad Gateway" {
 		t.Errorf("non-JSON body message = %q", plain.Message)
 	}
 }
@@ -206,5 +207,42 @@ func TestEmptyBatchesAreNotSent(t *testing.T) {
 	}
 	if err := c.trackEvents(nil); err != nil {
 		t.Error(err)
+	}
+}
+
+func TestAPIErrorRetryAfter(t *testing.T) {
+	cases := []struct {
+		name   string
+		header string
+		want   time.Duration
+	}{
+		{"valid", "12", 12 * time.Second},
+		{"missing", "", defaultRetryAfter},
+		{"garbage", "soon", defaultRetryAfter},
+		{"http date", "Wed, 21 Oct 2015 07:28:00 GMT", defaultRetryAfter},
+		{"negative", "-5", defaultRetryAfter},
+		{"over cap", "3600", maxRetryAfter},
+		{"overflow", "99999999999999999999999", maxRetryAfter},
+		{"zero", "0", minRetryAfter},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			header := http.Header{}
+			if tc.header != "" {
+				header.Set("Retry-After", tc.header)
+			}
+			apiErr := newAPIError(http.StatusTooManyRequests, header, []byte(`{"error":"Rate limit exceeded"}`))
+			if !apiErr.RateLimited() || !apiErr.Retryable() {
+				t.Error("429 must be rate limited and retryable")
+			}
+			if apiErr.RetryAfter != tc.want {
+				t.Errorf("RetryAfter = %v, want %v", apiErr.RetryAfter, tc.want)
+			}
+		})
+	}
+
+	header := http.Header{"Retry-After": []string{"12"}}
+	if other := newAPIError(503, header, nil); other.RateLimited() || other.RetryAfter != 0 {
+		t.Errorf("503: RateLimited=%v RetryAfter=%v, want false and 0", other.RateLimited(), other.RetryAfter)
 	}
 }

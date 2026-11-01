@@ -18,6 +18,16 @@ const (
 	batchSize         = 100
 	maxSubmitAttempts = 3
 	maxRetryQueueSize = 1000
+
+	// A 429 pauses the submitter for the response's Retry-After, read as
+	// delta-seconds. A missing or invalid value falls back to
+	// defaultRetryAfter; the value is clamped to [minRetryAfter,
+	// maxRetryAfter] (maxRetryAfter is the API's rate-limit window).
+	defaultRetryAfter = 30 * time.Second
+	minRetryAfter     = time.Second
+	maxRetryAfter     = 600 * time.Second
+	// maxDrainPause bounds the total time the final drain waits out pauses.
+	maxDrainPause = 5 * time.Second
 )
 
 // Config configures the SDK. Zero values take the documented defaults.

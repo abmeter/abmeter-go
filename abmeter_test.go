@@ -22,6 +22,31 @@ func quietLogger() *log.Logger {
 	return log.New(io.Discard, "", 0)
 }
 
+// logLines collects log output; the SDK logs from more than one goroutine.
+type logLines struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (l *logLines) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.lines = append(l.lines, strings.TrimSuffix(string(p), "\n"))
+	return len(p), nil
+}
+
+func (l *logLines) matching(substr string) []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var found []string
+	for _, line := range l.lines {
+		if strings.Contains(line, substr) {
+			found = append(found, line)
+		}
+	}
+	return found
+}
+
 func TestConfigureRequiresKeyOrStaticConfig(t *testing.T) {
 	resetSDK(t)
 	if err := Configure(Config{}); err == nil {
@@ -250,10 +275,11 @@ func TestStaleConfigServedWhenRefreshFails(t *testing.T) {
 	}))
 	defer server.Close()
 
+	logs := &logLines{}
 	err := Configure(Config{
 		APIKey: "k", BaseURL: server.URL,
 		FetchInterval: time.Nanosecond, FlushInterval: time.Hour,
-		Logger: quietLogger(),
+		Logger: log.New(logs, "", 0),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -270,7 +296,36 @@ func TestStaleConfigServedWhenRefreshFails(t *testing.T) {
 	if _, err := ResolveParameter(User{UserID: "u"}, "discount"); err != nil {
 		t.Errorf("resolve must serve stale config across a refresh failure, got %v", err)
 	}
+	if got := logs.matching("serving last known config"); len(got) != 1 {
+		t.Errorf("want one log line for the failed refresh, got %q", got)
+	}
 	Reset(context.Background())
+}
+
+func TestFailedFirstFetchLogsAndErrors(t *testing.T) {
+	resetSDK(t)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`{"error":"boom"}`))
+	}))
+	defer server.Close()
+
+	logs := &logLines{}
+	err := Configure(Config{
+		APIKey: "k", BaseURL: server.URL, FlushInterval: time.Hour,
+		Logger: log.New(logs, "", 0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ResolveParameter(User{UserID: "u"}, "discount"); err == nil {
+		t.Error("resolve must error when the first fetch fails")
+	}
+	if got := logs.matching("refreshing assignment config failed"); len(got) != 1 {
+		t.Errorf("want one log line for the failed fetch, got %q", got)
+	}
+	ResetNow()
 }
 
 func TestGetExposureDoesNotSubmit(t *testing.T) {

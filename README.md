@@ -104,6 +104,11 @@ abmeter.ResetNow()
 
 `Reset` returns an error when the drain did not finish in time.
 
+On a 429 the SDK pauses submits for the response's `Retry-After` (capped at
+10 minutes) and then delivers the queued items; the wait never counts as a
+retry attempt. `Reset` waits out at most 5 seconds of such pauses, then drops
+what is left and logs the count.
+
 ## Errors
 
 All entry points return errors instead of panicking. A failing config refresh

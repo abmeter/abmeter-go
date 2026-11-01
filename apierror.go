@@ -2,7 +2,11 @@ package abmeter
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
+	"strconv"
+	"strings"
+	"time"
 )
 
 // APIError is returned for non-success responses from the ABMeter API.
@@ -11,10 +15,16 @@ type APIError struct {
 	Message string
 	Code    string
 	Details map[string]any
+	// RetryAfter is how long to wait before the next submit. Set on a 429
+	// only, from the Retry-After header; zero otherwise.
+	RetryAfter time.Duration
 }
 
-func newAPIError(status int, body []byte) *APIError {
+func newAPIError(status int, header http.Header, body []byte) *APIError {
 	apiErr := &APIError{Status: status, Details: map[string]any{}}
+	if status == http.StatusTooManyRequests {
+		apiErr.RetryAfter = parseRetryAfter(header.Get("Retry-After"))
+	}
 
 	var parsed struct {
 		Error   string         `json:"error"`
@@ -36,6 +46,21 @@ func newAPIError(status int, body []byte) *APIError {
 	return apiErr
 }
 
+// parseRetryAfter reads a delta-seconds Retry-After value. HTTP dates,
+// negative and non-numeric values fall back to defaultRetryAfter.
+func parseRetryAfter(value string) time.Duration {
+	seconds, err := strconv.ParseUint(strings.TrimSpace(value), 10, 64)
+	switch {
+	case errors.Is(err, strconv.ErrRange):
+		return maxRetryAfter
+	case err != nil:
+		return defaultRetryAfter
+	case seconds > uint64(maxRetryAfter/time.Second):
+		return maxRetryAfter
+	}
+	return max(time.Duration(seconds)*time.Second, minRetryAfter)
+}
+
 func (e *APIError) Error() string {
 	return e.Message
 }
@@ -46,6 +71,12 @@ func (e *APIError) Retryable() bool {
 	return e.Status >= 500 ||
 		e.Status == http.StatusRequestTimeout ||
 		e.Status == http.StatusTooManyRequests
+}
+
+// RateLimited reports a 429: the submitter pauses for RetryAfter instead of
+// counting an attempt.
+func (e *APIError) RateLimited() bool {
+	return e.Status == http.StatusTooManyRequests
 }
 
 // PartialFailure reports a 400 where some items in the batch failed

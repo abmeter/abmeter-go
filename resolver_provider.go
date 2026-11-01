@@ -2,6 +2,7 @@ package abmeter
 
 import (
 	"errors"
+	"log"
 	"sync"
 	"time"
 )
@@ -14,6 +15,7 @@ type resolverProvider struct {
 	mu            sync.Mutex
 	apiClient     *client
 	sub           *submitter
+	logger        *log.Logger
 	staticConfig  string
 	fetchInterval time.Duration
 
@@ -26,6 +28,7 @@ func newResolverProvider(cfg *Config, apiClient *client, sub *submitter) (*resol
 	provider := &resolverProvider{
 		apiClient:     apiClient,
 		sub:           sub,
+		logger:        cfg.Logger,
 		staticConfig:  cfg.StaticConfig,
 		fetchInterval: cfg.FetchInterval,
 	}
@@ -74,8 +77,10 @@ func (p *resolverProvider) currentResolver() (*userParameterResolver, error) {
 		if err := p.refreshLocked(); err != nil {
 			// Keep serving the previous config when a refresh fails.
 			if p.resolver == nil {
+				p.logf("refreshing assignment config failed: %v", err)
 				return nil, err
 			}
+			p.logf("refreshing assignment config failed, serving last known config: %v", err)
 			p.lastFetchedAt = time.Now()
 		}
 	}
@@ -100,4 +105,10 @@ func (p *resolverProvider) refreshLocked() error {
 	}
 	p.lastFetchedAt = time.Now()
 	return nil
+}
+
+func (p *resolverProvider) logf(format string, args ...any) {
+	if p.logger != nil {
+		p.logger.Printf("ResolverProvider: "+format, args...)
+	}
 }

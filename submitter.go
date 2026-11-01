@@ -38,7 +38,12 @@ type retryItem struct {
 //
 // The retry contract is asymmetric by event kind and feeds the recovery
 // harness's completeness gate — preserve it exactly:
-//   - Retryable APIError (5xx/408/429): both kinds go to the bounded retry
+//   - Rate limited (429): the submitter pauses for the response's
+//     RetryAfter and submits nothing until it passes. The rate-limited batch,
+//     and any batch already taken from the main queue in the same flush, go
+//     to the bounded retry queue with attempts unchanged: the wait never
+//     counts, so these items drop only when the retry queue is full.
+//   - Other retryable APIError (5xx/408): both kinds go to the bounded retry
 //     queue (max 1000 items, max 3 attempts each).
 //   - Partial validation failure / permanent APIError: dropped — validation
 //     won't change.
@@ -48,6 +53,9 @@ type retryItem struct {
 // The main queue is deliberately unbounded (mutex-guarded slice, matching
 // Ruby's Queue): a bounded channel would silently drop under burst load,
 // which the completeness gate would surface as data loss.
+//
+// The final drain waits out pauses up to maxDrainPause in total, then drops
+// what is left: stop(ctx) abandons the worker, so the drain must end alone.
 type submitter struct {
 	queue         chan queueItem // enqueue side; effectively unbounded via pending
 	flushInterval time.Duration
@@ -55,8 +63,13 @@ type submitter struct {
 	logger        *log.Logger
 
 	// Owned by the worker goroutine between start and doneCh close.
-	pending    []queueItem
-	retryQueue []retryItem
+	pending     []queueItem
+	retryQueue  []retryItem
+	pausedUntil time.Time
+
+	// Injectable for tests.
+	now   func() time.Time
+	sleep func(time.Duration)
 
 	stopCh chan struct{}
 	doneCh chan struct{}
@@ -74,6 +87,8 @@ func newSubmitter(apiClient *client, cfg *Config) *submitter {
 		flushInterval: cfg.FlushInterval,
 		client:        apiClient,
 		logger:        cfg.Logger,
+		now:           time.Now,
+		sleep:         time.Sleep,
 		stopCh:        make(chan struct{}),
 		doneCh:        make(chan struct{}),
 	}
@@ -176,7 +191,13 @@ func (s *submitter) collect() {
 // items grouped by kind — one flush-interval turn.
 func (s *submitter) flushOnce() {
 	s.collect()
+	if s.paused() {
+		return
+	}
 	s.processRetryQueue()
+	if s.paused() {
+		return
+	}
 
 	n := len(s.pending)
 	if n > batchSize {
@@ -202,58 +223,95 @@ func (s *submitter) flushOnce() {
 		s.submitBatch(kindExposure, exposuresAsItems(exposures), false)
 	}
 	if len(events) > 0 {
-		s.submitBatch(kindEvent, eventsAsItems(events), false)
+		if s.paused() {
+			s.addToRetryQueue(eventsAsItems(events))
+		} else {
+			s.submitBatch(kindEvent, eventsAsItems(events), false)
+		}
 	}
 }
 
 // drainAll flushes until both queues are empty — the flush barrier used by
-// graceful shutdown and flushSync. Items that keep failing retryably are
-// dropped by the attempts cap, so this terminates.
+// graceful shutdown. Items that keep failing with 5xx/408 are dropped by the
+// attempts cap; rate-limit pauses are waited out up to maxDrainPause in
+// total, then everything left is dropped, so this terminates.
 func (s *submitter) drainAll() {
+	var waited time.Duration
 	for {
 		s.collect()
 		if len(s.pending) == 0 && len(s.retryQueue) == 0 {
 			return
 		}
+		if wait := s.pausedUntil.Sub(s.now()); wait > 0 {
+			if waited+wait > maxDrainPause {
+				dropped := len(s.pending) + len(s.retryQueue)
+				s.pending = nil
+				s.retryQueue = nil
+				s.log(fmt.Sprintf("rate limited for %ds more, past the drain budget; dropping %d items", ceilSeconds(wait), dropped))
+				return
+			}
+			s.sleep(wait)
+			waited += wait
+			continue
+		}
 		s.flushOnce()
 	}
 }
 
-func (s *submitter) submitBatch(kind itemKind, items []queueItem, isRetry bool) []queueItem {
+func (s *submitter) paused() bool {
+	return s.now().Before(s.pausedUntil)
+}
+
+func (s *submitter) pause(retryAfter time.Duration, count int, kind itemKind) {
+	if until := s.now().Add(retryAfter); until.After(s.pausedUntil) {
+		s.pausedUntil = until
+	}
+	s.log(fmt.Sprintf("warning: rate limited, pausing submits for %ds (%d %ss to retry)", ceilSeconds(retryAfter), count, kind))
+}
+
+// submitBatch sends one batch and returns the items a retry pass should keep;
+// rateLimited reports a 429 (the submitter is now paused).
+func (s *submitter) submitBatch(kind itemKind, items []queueItem, isRetry bool) (kept []queueItem, rateLimited bool) {
 	if len(items) == 0 {
-		return nil
+		return nil, false
 	}
 	err := s.send(kind, items)
 	if err == nil {
-		return nil
+		return nil, false
 	}
 
 	if apiErr, ok := err.(*APIError); ok {
 		switch {
+		case apiErr.RateLimited():
+			s.pause(apiErr.RetryAfter, len(items), kind)
+			if isRetry {
+				return items, true
+			}
+			s.addToRetryQueue(items)
+			return nil, true
 		case apiErr.Retryable():
 			s.log(fmt.Sprintf("retryable error submitting %d %ss: %s", len(items), kind, apiErr.Message))
 			if isRetry {
-				return items
+				return items, false
 			}
 			s.addToRetryQueue(items)
-			return nil
+			return nil, false
 		case apiErr.PartialFailure():
 			s.log(fmt.Sprintf("%d out of %d %ss failed validation", apiErr.FailureCount(), len(items), kind))
-			return nil
+			return nil, false
 		default:
 			s.log(fmt.Sprintf("permanent error submitting %ss: %s", kind, apiErr.Message))
-			return nil
+			return nil, false
 		}
 	}
 
 	// Unknown transport error: drop on first submit (unknown cause). On
 	// retry the contract is asymmetric — exposures re-queue, events drop.
-	if isRetry && kind == kindExposure {
-		s.log(fmt.Sprintf("failed to submit %d %ss: %v", len(items), kind, err))
-		return items
-	}
 	s.log(fmt.Sprintf("failed to submit %d %ss: %v", len(items), kind, err))
-	return nil
+	if isRetry && kind == kindExposure {
+		return items, false
+	}
+	return nil, false
 }
 
 func (s *submitter) send(kind itemKind, items []queueItem) error {
@@ -272,12 +330,12 @@ func (s *submitter) send(kind itemKind, items []queueItem) error {
 }
 
 func (s *submitter) addToRetryQueue(items []queueItem) {
-	for _, item := range items {
-		if len(s.retryQueue) < maxRetryQueueSize {
-			s.retryQueue = append(s.retryQueue, retryItem{queueItem: item})
-		} else {
-			s.log(fmt.Sprintf("retry queue full, dropping %s", item.kind))
-		}
+	room := min(max(maxRetryQueueSize-len(s.retryQueue), 0), len(items))
+	for _, item := range items[:room] {
+		s.retryQueue = append(s.retryQueue, retryItem{queueItem: item})
+	}
+	if dropped := len(items) - room; dropped > 0 {
+		s.log(fmt.Sprintf("retry queue full, dropping %d %ss", dropped, items[0].kind))
 	}
 }
 
@@ -294,12 +352,17 @@ func (s *submitter) processRetryQueue() {
 				batch = append(batch, item)
 			}
 		}
+		if s.paused() {
+			s.retryQueue = append(s.retryQueue, batch...)
+			continue
+		}
 		s.retryQueue = append(s.retryQueue, s.processRetryBatch(kind, batch)...)
 	}
 }
 
 // processRetryBatch bumps attempts (dropping items at the cap), resubmits,
-// and returns the items to keep for a future retry.
+// and returns the items to keep for a future retry. A 429 undoes the bump:
+// the wait never counts as an attempt.
 func (s *submitter) processRetryBatch(kind itemKind, items []retryItem) []retryItem {
 	if len(items) == 0 {
 		return nil
@@ -321,10 +384,21 @@ func (s *submitter) processRetryBatch(kind itemKind, items []retryItem) []retryI
 	for i, item := range active {
 		data[i] = item.queueItem
 	}
-	if kept := s.submitBatch(kind, data, true); len(kept) > 0 {
+	kept, rateLimited := s.submitBatch(kind, data, true)
+	if rateLimited {
+		for i := range active {
+			active[i].attempts--
+		}
+		return active
+	}
+	if len(kept) > 0 {
 		return active
 	}
 	return nil
+}
+
+func ceilSeconds(d time.Duration) int64 {
+	return int64((d + time.Second - 1) / time.Second)
 }
 
 func exposuresAsItems(exposures []Exposure) []queueItem {

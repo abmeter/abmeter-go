@@ -1,12 +1,14 @@
 package abmeter
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -20,6 +22,9 @@ type recordingServer struct {
 	exposures [][]map[string]any
 	events    [][]map[string]any
 	failWith  func() (status int, body string) // nil = succeed
+	posts     int
+	// retryAfter is sent as the Retry-After header on every 429.
+	retryAfter string
 }
 
 func newRecordingServer(t *testing.T) *recordingServer {
@@ -27,10 +32,15 @@ func newRecordingServer(t *testing.T) *recordingServer {
 	rs.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rs.mu.Lock()
 		fail := rs.failWith
+		rs.posts++
+		retryAfter := rs.retryAfter
 		rs.mu.Unlock()
 		if fail != nil {
 			// A zero status from the failure func means "succeed this time".
 			if status, body := fail(); status != 0 {
+				if status == http.StatusTooManyRequests && retryAfter != "" {
+					w.Header().Set("Retry-After", retryAfter)
+				}
 				w.WriteHeader(status)
 				io.WriteString(w, body)
 				return
@@ -56,6 +66,12 @@ func (rs *recordingServer) setFailure(f func() (int, string)) {
 	rs.mu.Lock()
 	rs.failWith = f
 	rs.mu.Unlock()
+}
+
+func (rs *recordingServer) postCount() int {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	return rs.posts
 }
 
 func (rs *recordingServer) exposureCount() int {
@@ -281,7 +297,7 @@ func TestRetryTransportAsymmetry(t *testing.T) {
 	}
 
 	// First-submit pass (not a retry): both kinds dropped — unknown cause.
-	if kept := s.submitBatch(kindExposure, exposuresAsItems([]Exposure{testExposure("u2")}), false); len(kept) != 0 {
+	if kept, _ := s.submitBatch(kindExposure, exposuresAsItems([]Exposure{testExposure("u2")}), false); len(kept) != 0 {
 		t.Errorf("first-submit transport error must drop, kept %d", len(kept))
 	}
 }
@@ -306,5 +322,193 @@ func TestGracefulStopTimesOutAgainstHungServer(t *testing.T) {
 	defer cancel()
 	if err := s.stop(ctx); err == nil {
 		t.Error("expected timeout error from stop against a hung server")
+	}
+}
+
+// fakeClock drives the submitter's pause without real waiting. Tests that use
+// it call flushOnce/drainAll directly from the test goroutine.
+type fakeClock struct{ now time.Time }
+
+func (c *fakeClock) Now() time.Time          { return c.now }
+func (c *fakeClock) Advance(d time.Duration) { c.now = c.now.Add(d) }
+
+func newPausableSubmitter(t *testing.T, baseURL string) (*submitter, *fakeClock, *bytes.Buffer) {
+	t.Helper()
+	logs := &bytes.Buffer{}
+	cfg := Config{
+		APIKey: "k", BaseURL: baseURL,
+		FlushInterval: time.Hour, Logger: log.New(logs, "", 0),
+	}.withDefaults()
+	s := newSubmitter(newClient(&cfg), &cfg)
+	clock := &fakeClock{now: time.Unix(1_700_000_000, 0)}
+	s.now = clock.Now
+	s.sleep = func(d time.Duration) { t.Fatalf("unexpected sleep %v", d) }
+	return s, clock, logs
+}
+
+// failFirst returns a failure func that answers status for the first n posts
+// and succeeds afterwards.
+func failFirst(n int, status int) func() (int, string) {
+	var mu sync.Mutex
+	var calls int
+	return func() (int, string) {
+		mu.Lock()
+		defer mu.Unlock()
+		calls++
+		if calls <= n {
+			return status, `{"error":"failing"}`
+		}
+		return 0, ""
+	}
+}
+
+func TestRateLimitPausesThenDeliversEverything(t *testing.T) {
+	server := newRecordingServer(t)
+	server.retryAfter = "7"
+	// More consecutive 429s than maxSubmitAttempts: the wait never counts.
+	server.setFailure(failFirst(maxSubmitAttempts+3, http.StatusTooManyRequests))
+	s, clock, logs := newPausableSubmitter(t, server.URL)
+
+	s.pending = append(s.pending,
+		queueItem{kind: kindExposure, exposure: testExposure("u1")},
+		queueItem{kind: kindExposure, exposure: testExposure("u2")},
+		queueItem{kind: kindEvent, event: event{EventSlug: "purchase", UserID: "u1"}},
+	)
+	s.flushOnce()
+
+	// The exposure batch got the 429; the event batch from the same flush
+	// went to the retry queue without being sent.
+	if got := server.postCount(); got != 1 {
+		t.Fatalf("posts after first flush = %d, want 1", got)
+	}
+	if len(s.retryQueue) != 3 || len(s.pending) != 0 {
+		t.Fatalf("retry=%d pending=%d, want 3 and 0", len(s.retryQueue), len(s.pending))
+	}
+	if !strings.Contains(logs.String(), "warning: rate limited, pausing submits for 7s (2 exposures to retry)") {
+		t.Errorf("missing pause warning, logs:\n%s", logs.String())
+	}
+
+	// While paused nothing is sent, including newly queued items.
+	s.pending = append(s.pending, queueItem{kind: kindExposure, exposure: testExposure("u3")})
+	s.flushOnce()
+	if got := server.postCount(); got != 1 {
+		t.Fatalf("posts while paused = %d, want 1", got)
+	}
+	if len(s.pending) != 1 {
+		t.Fatalf("pending while paused = %d, want 1", len(s.pending))
+	}
+
+	for i := 0; i < 20 && (len(s.pending) > 0 || len(s.retryQueue) > 0); i++ {
+		clock.Advance(7 * time.Second)
+		s.flushOnce()
+	}
+
+	if got := server.exposureCount(); got != 3 {
+		t.Errorf("exposures delivered = %d, want 3 (no loss under 429)", got)
+	}
+	if got := server.eventCount(); got != 1 {
+		t.Errorf("events delivered = %d, want 1 (no loss under 429)", got)
+	}
+	if strings.Contains(logs.String(), "max retries exceeded") {
+		t.Errorf("429 counted as an attempt, logs:\n%s", logs.String())
+	}
+}
+
+func TestRateLimitOnRetryKeepsAttempts(t *testing.T) {
+	server := newRecordingServer(t)
+	server.retryAfter = "1"
+	server.setFailure(func() (int, string) { return http.StatusTooManyRequests, "" })
+	s, _, _ := newPausableSubmitter(t, server.URL)
+
+	s.retryQueue = []retryItem{{queueItem: queueItem{kind: kindExposure, exposure: testExposure("u1")}, attempts: 1}}
+	s.processRetryQueue()
+
+	if len(s.retryQueue) != 1 || s.retryQueue[0].attempts != 1 {
+		t.Fatalf("retry queue = %+v, want one item with attempts 1", s.retryQueue)
+	}
+}
+
+func TestRateLimitFullRetryQueueDropsAndLogsCountOnce(t *testing.T) {
+	server := newRecordingServer(t)
+	server.setFailure(func() (int, string) { return http.StatusTooManyRequests, "" })
+	s, _, logs := newPausableSubmitter(t, server.URL)
+
+	for len(s.retryQueue) < maxRetryQueueSize-2 {
+		s.retryQueue = append(s.retryQueue, retryItem{queueItem: queueItem{kind: kindEvent}})
+	}
+	items := make([]queueItem, 5)
+	for i := range items {
+		items[i] = queueItem{kind: kindExposure, exposure: testExposure("u" + itoa(i))}
+	}
+	s.submitBatch(kindExposure, items, false)
+
+	if len(s.retryQueue) != maxRetryQueueSize {
+		t.Errorf("retry queue = %d, want %d", len(s.retryQueue), maxRetryQueueSize)
+	}
+	if got := strings.Count(logs.String(), "retry queue full"); got != 1 {
+		t.Errorf("retry-queue-full lines = %d, want 1; logs:\n%s", got, logs.String())
+	}
+	if !strings.Contains(logs.String(), "retry queue full, dropping 3 exposures") {
+		t.Errorf("missing drop count, logs:\n%s", logs.String())
+	}
+}
+
+func TestDrainAllWaitsOutShortPause(t *testing.T) {
+	server := newRecordingServer(t)
+	server.retryAfter = "2"
+	server.setFailure(failFirst(1, http.StatusTooManyRequests))
+	s, clock, _ := newPausableSubmitter(t, server.URL)
+	var slept time.Duration
+	s.sleep = func(d time.Duration) { slept += d; clock.Advance(d) }
+
+	s.pending = append(s.pending, queueItem{kind: kindExposure, exposure: testExposure("u1")})
+	s.drainAll()
+
+	if got := server.exposureCount(); got != 1 {
+		t.Errorf("exposures delivered = %d, want 1", got)
+	}
+	if slept != 2*time.Second {
+		t.Errorf("slept %v, want 2s", slept)
+	}
+}
+
+func TestDrainAllStopsWithinBudgetUnderLongPause(t *testing.T) {
+	server := newRecordingServer(t)
+	server.retryAfter = "2"
+	server.setFailure(func() (int, string) { return http.StatusTooManyRequests, "" })
+	s, clock, logs := newPausableSubmitter(t, server.URL)
+	var slept time.Duration
+	s.sleep = func(d time.Duration) { slept += d; clock.Advance(d) }
+
+	s.pending = append(s.pending,
+		queueItem{kind: kindExposure, exposure: testExposure("u1")},
+		queueItem{kind: kindEvent, event: event{EventSlug: "e", UserID: "u1"}},
+	)
+	s.drainAll()
+
+	if slept > maxDrainPause {
+		t.Errorf("drain slept %v, budget is %v", slept, maxDrainPause)
+	}
+	if len(s.pending) != 0 || len(s.retryQueue) != 0 {
+		t.Errorf("drain left pending=%d retry=%d", len(s.pending), len(s.retryQueue))
+	}
+	if !strings.Contains(logs.String(), "dropping 2 items") {
+		t.Errorf("missing drop count, logs:\n%s", logs.String())
+	}
+}
+
+func TestDrainAllDropsAtOnceWhenPauseExceedsBudget(t *testing.T) {
+	server := newRecordingServer(t)
+	s, clock, logs := newPausableSubmitter(t, server.URL)
+	s.pausedUntil = clock.Now().Add(maxRetryAfter)
+
+	s.pending = append(s.pending, queueItem{kind: kindExposure, exposure: testExposure("u1")})
+	s.drainAll() // sleep is wired to fail the test
+
+	if server.postCount() != 0 || len(s.pending) != 0 {
+		t.Errorf("posts=%d pending=%d, want 0 and 0", server.postCount(), len(s.pending))
+	}
+	if !strings.Contains(logs.String(), "dropping 1 items") {
+		t.Errorf("missing drop count, logs:\n%s", logs.String())
 	}
 }

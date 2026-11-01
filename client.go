@@ -69,7 +69,7 @@ func (c *client) getAssignmentConfig(etag string) (configResponse, error) {
 		return configResponse{}, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return configResponse{}, newAPIError(resp.StatusCode, body)
+		return configResponse{}, newAPIError(resp.StatusCode, resp.Header, body)
 	}
 
 	var parsed struct {
@@ -115,7 +115,7 @@ func (c *client) post(path string, payload any) error {
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		respBody, _ := io.ReadAll(resp.Body)
-		return newAPIError(resp.StatusCode, respBody)
+		return newAPIError(resp.StatusCode, resp.Header, respBody)
 	}
 	return nil
 }

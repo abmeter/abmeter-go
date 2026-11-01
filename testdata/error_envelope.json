@@ -1,0 +1,90 @@
+{
+  "description": "Golden samples of the ABMeter API error envelope. `body` is the raw response body; `expected` is what every SDK error class must read from it. A null `message` means the SDK picks its own fallback text.",
+  "samples": [
+    {
+      "name": "plain",
+      "status": 401,
+      "body": "{\"error\":\"Authentication required\"}",
+      "expected": {
+        "message": "Authentication required",
+        "code": null,
+        "details": {},
+        "retryable": false,
+        "partial_failure": false,
+        "failure_count": 0
+      }
+    },
+    {
+      "name": "with_details",
+      "status": 400,
+      "body": "{\"error\":\"Bad request\",\"details\":{\"slug\":[\"can only contain lowercase letters, numbers and hyphens\"]}}",
+      "expected": {
+        "message": "Bad request",
+        "code": null,
+        "details": {
+          "slug": [
+            "can only contain lowercase letters, numbers and hyphens"
+          ]
+        },
+        "retryable": false,
+        "partial_failure": false,
+        "failure_count": 0
+      }
+    },
+    {
+      "name": "with_code",
+      "status": 402,
+      "body": "{\"error\":\"Monthly active items limit reached (500,000/500,000). Limit resets on the 1st of next month. If this limit blocks a real experiment, write to support@abmeter.com.\",\"code\":\"quota_exceeded\",\"details\":{\"current\":500000,\"limit\":500000}}",
+      "expected": {
+        "message": "Monthly active items limit reached (500,000/500,000). Limit resets on the 1st of next month. If this limit blocks a real experiment, write to support@abmeter.com.",
+        "code": "quota_exceeded",
+        "details": {
+          "current": 500000,
+          "limit": 500000
+        },
+        "retryable": false,
+        "partial_failure": false,
+        "failure_count": 0
+      }
+    },
+    {
+      "name": "partial_failure",
+      "status": 400,
+      "body": "{\"error\":\"Failed to process 2 out of 3 events\",\"details\":{\"recorded_count\":1,\"invalid_count\":2,\"failures\":[{\"index\":1,\"error\":\"Event type 'missing' not found\"},{\"index\":2,\"error\":\"Missing required fields: user_id\"}]}}",
+      "expected": {
+        "message": "Failed to process 2 out of 3 events",
+        "code": null,
+        "details": {
+          "recorded_count": 1,
+          "invalid_count": 2,
+          "failures": [
+            {
+              "index": 1,
+              "error": "Event type 'missing' not found"
+            },
+            {
+              "index": 2,
+              "error": "Missing required fields: user_id"
+            }
+          ]
+        },
+        "retryable": false,
+        "partial_failure": true,
+        "failure_count": 2
+      }
+    },
+    {
+      "name": "non_json",
+      "status": 502,
+      "body": "Bad Gateway",
+      "expected": {
+        "message": null,
+        "code": null,
+        "details": {},
+        "retryable": true,
+        "partial_failure": false,
+        "failure_count": 0
+      }
+    }
+  ]
+}
